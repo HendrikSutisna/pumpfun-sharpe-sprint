@@ -1,25 +1,22 @@
-// Launch-surge sniper for agent-fun/replay/v2 (pump.fun bonding-curve replay),
-// tuned for the SHARPE SPRINT: the rank key is the hourly Sharpe ratio, not
-// net PnL, so this bot optimises for steady, low-variance hourly gains.
+// Pump.fun Sharpe Sprint — launch-surge sniper for agent-fun/replay/v2.
 //
-// Idea, measured on the dev window's own data: a coin's fate is largely written
-// in its CREATE SLOT. Coins with >=5 SOL of buys and >=8 distinct buyers in the
-// create slot peak >=2x half the time and complete ~19% of the time; coins with
-// <0.5 SOL of create-slot buys almost never peak above 1.5x. So this bot buys
-// only those hot launches, at age 0-1, then sells everything at +20% over cost,
-// cuts fast at -5%, or exits after 300 slots if it never pops. The tight stop
-// keeps losing hours small (the variance term of the Sharpe ratio), the +20%
-// take-profit caps each win so no single hour dominates the hourly returns,
-// and stakes are capped by the harness's per-mint order cap (maxBuyLamports).
-// Fast turnover through the 5 open-position slots, and a probe fallback that
-// keeps the guardrail (20 coins, 0.01 SOL round trips) on pace over the 6-hour
-// final window if entries dry up.
-
+// The ranking metric is hourly Sharpe on a 6-hour forward replay, not raw
+// PnL, so the bot is tuned for steady, guardrail-clean gains: it buys only
+// hot launches, exits fast, and keeps the coin count on pace.
+//
+// What the dev window's own tape says: a coin's fate is largely written in
+// its CREATE SLOT. Coins with >=5 SOL of net buys and >=8 distinct buyers in
+// the create slot are the ones that pop; coins with a thin create slot almost
+// never peak above 1.5x. So entries are restricted to those hot launches, at
+// age 0-1 slots, with a small fixed stake. Exits are a +20% take-profit (sell
+// all), a -5% stop, or a 300-slot max hold if it never pops, plus an exit when
+// the creator sells while held or the curve completes. A probe fallback keeps
+// the guardrail (20 coins, 0.01 SOL round trips) on pace when entries dry up.
 //
 // Deterministic by construction: no clock, no randomness, no I/O, no network.
 // Every decision is a pure function of the hello, the batches and the account
-// the harness reports; iteration is only over insertion-ordered maps fed by the
-// batch stream, so two runs produce byte-identical action logs.
+// the harness reports; iteration is only over insertion-ordered maps fed by
+// the batch stream, so two runs produce byte-identical action logs.
 
 import { runBot, type Batch, type BotState, type OrderInput, type Pubkey } from './vendor/makefun-bot.ts';
 import { pathToFileURL } from 'node:url';
@@ -64,12 +61,9 @@ export interface Params {
   maxProbes: number;
 }
 
-// Settings tuned for HOURLY SHARPE on the dev window (24h full + four 6h slices,
-// the final window's shape), preferring the flat region around them:
-// buyers>=8 + buySol>=5, stake 0.5 SOL, take all at +20%, stop -5%, hold 300,
-// probes paced over 6h toward 22 coins at 0.01 SOL.
-// Dev (grade-local, new kit): Sharpe 0.57, net +0.83 SOL, 49 coins, dd 0.9%;
-// 6h slices: Sharpe 0.24 / 0.73 / 0.71 / 0.42, all PnL-positive, >=22 coins.
+// Settings tuned on the dev window (Sharpe retune of the replay-sprint sniper):
+// buyers>=8 + net buy>=5 SOL, stake 0.5 SOL, take all at +20%, stop -5%,
+// hold 300 slots, pace toward 22 coins over 6 hours with 0.01 SOL probes.
 export const DEFAULT_PARAMS: Params = {
   maxEntryAge: 1,
   minBuySol0: 5,
@@ -139,6 +133,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
   const held = new Map<Pubkey, Held>();
   /** Probe round trips in flight, by mint: 'buy' while the probe buy is pending, 'sell' once selling. */
   const probes = new Map<Pubkey, 'buy' | 'sell'>();
+  /** Mints a probe round trip already completed on: never probe the same mint twice. */
+  const probedMints = new Set<Pubkey>();
   let probeSeq = 0;
   let myFills = 0;
   const myCoins = new Set<Pubkey>();
@@ -202,8 +198,13 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
           if (f.status === 'filled' && f.side === 'buy') probes.set(f.mint, 'sell');
           else if (f.status !== 'filled') probes.delete(f.mint);
         } else if (f.client_id.startsWith('ps')) {
-          if (f.status === 'filled' && f.side === 'sell') probes.delete(f.mint);
-          else if (f.status !== 'filled') probes.set(f.mint, 'sell');
+          if (f.status === 'filled' && f.side === 'sell') {
+            probes.delete(f.mint);
+            // Round trip complete: retire this mint from future probes so the
+            // guardrail spend spreads across distinct coins instead of
+            // re-probing one mint that happens to trade every batch.
+            probedMints.add(f.mint);
+          } else if (f.status !== 'filled') probes.set(f.mint, 'sell');
         }
       }
       // Track positions and the orders already in flight for them.
@@ -304,7 +305,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
         // probe is guardrail insurance, not a trade: waiting for breakeven
         // would strand it in a crashed coin and clog the 5 open-position
         // slots, blocking the real entries. The round trip costs ~2 tx fees
-        // plus the curve fee on 0.012 SOL.
+        // plus the curve fee on 0.01 SOL.
         for (const [mint, stage] of probes) {
           if (orders.length >= 16) break;
           if (stage !== 'sell') continue;
@@ -327,6 +328,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
             const c = coins.get(e.mint);
             if (c === undefined) continue;
             if (c.done || c.complete || c.devSold) continue;
+            if (probedMints.has(c.mint)) continue;
             if (heldMints.has(c.mint) || pendingBuy.has(c.mint) || probes.has(c.mint)) continue;
             const curve = state.curves.get(c.mint);
             if (curve === undefined || curve.complete) continue;
